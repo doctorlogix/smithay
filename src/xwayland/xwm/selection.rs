@@ -37,9 +37,19 @@ pub const INCR_CHUNK_SIZE: usize = 64 * 1024;
 const CHANGE_PROPERTY_REQUEST_OVERHEAD: usize = 28;
 
 pub(super) fn direct_property_limit(conn: &RustConnection) -> usize {
-    conn.maximum_request_bytes()
-        .saturating_sub(CHANGE_PROPERTY_REQUEST_OVERHEAD)
-        & !3
+    direct_property_limit_for(conn.maximum_request_bytes())
+}
+
+fn direct_property_limit_for(maximum_request_bytes: usize) -> usize {
+    maximum_request_bytes.saturating_sub(CHANGE_PROPERTY_REQUEST_OVERHEAD) & !3
+}
+
+fn transfer_chunk_len(incremental: bool, available: usize) -> usize {
+    if incremental {
+        available.min(INCR_CHUNK_SIZE)
+    } else {
+        available
+    }
 }
 
 #[derive(Debug)]
@@ -144,11 +154,7 @@ impl fmt::Debug for OutgoingTransfer {
 
 impl OutgoingTransfer {
     pub fn flush_data(&mut self) -> Result<usize, ReplyOrIdError> {
-        let len = if self.incr {
-            std::cmp::min(self.source_data.len(), INCR_CHUNK_SIZE)
-        } else {
-            self.source_data.len()
-        };
+        let len = transfer_chunk_len(self.incr, self.source_data.len());
 
         if len == 0 {
             // This flush will complete the transfer
@@ -416,4 +422,23 @@ pub fn send_selection_notify_resp(
     )?;
     conn.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn direct_property_limit_reserves_the_extended_header_and_padding() {
+        assert_eq!(direct_property_limit_for(27), 0);
+        assert_eq!(direct_property_limit_for(32), 4);
+        assert_eq!(direct_property_limit_for(1027), 996);
+    }
+
+    #[test]
+    fn direct_transfers_are_not_truncated_at_the_incremental_chunk_size() {
+        let screenshot_size = INCR_CHUNK_SIZE + 42_988;
+        assert_eq!(transfer_chunk_len(false, screenshot_size), screenshot_size);
+        assert_eq!(transfer_chunk_len(true, screenshot_size), INCR_CHUNK_SIZE);
+    }
 }
