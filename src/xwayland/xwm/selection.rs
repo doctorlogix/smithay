@@ -8,7 +8,7 @@ use std::{
 use calloop::{LoopHandle, RegistrationToken};
 use tracing::{debug, trace, warn};
 use x11rb::{
-    connection::Connection as _,
+    connection::{Connection as _, RequestConnection as _},
     errors::ReplyOrIdError,
     protocol::{
         xfixes::{ConnectionExt as _, SelectionEventMask},
@@ -30,6 +30,17 @@ use crate::{
 // copied from wlroots - docs say "maximum size can vary widely depending on the implementation"
 // and there is no way to query the maximum size, you just get a non-descriptive `Length` error...
 pub const INCR_CHUNK_SIZE: usize = 64 * 1024;
+
+// ChangeProperty has a 24-byte core request header. BIG-REQUESTS adds another
+// four bytes, and the payload is padded to a four-byte boundary. Reserving the
+// extended header unconditionally also leaves core-only servers a safe margin.
+const CHANGE_PROPERTY_REQUEST_OVERHEAD: usize = 28;
+
+pub(super) fn direct_property_limit(conn: &RustConnection) -> usize {
+    conn.maximum_request_bytes()
+        .saturating_sub(CHANGE_PROPERTY_REQUEST_OVERHEAD)
+        & !3
+}
 
 #[derive(Debug)]
 pub struct XWmSelection {
@@ -107,6 +118,7 @@ pub struct OutgoingTransfer {
     pub token: Option<RegistrationToken>,
 
     pub incr: bool,
+    pub direct_property_limit: usize,
     pub source_data: Vec<u8>,
     pub request: SelectionRequestEvent,
 
@@ -132,7 +144,11 @@ impl fmt::Debug for OutgoingTransfer {
 
 impl OutgoingTransfer {
     pub fn flush_data(&mut self) -> Result<usize, ReplyOrIdError> {
-        let len = std::cmp::min(self.source_data.len(), INCR_CHUNK_SIZE);
+        let len = if self.incr {
+            std::cmp::min(self.source_data.len(), INCR_CHUNK_SIZE)
+        } else {
+            self.source_data.len()
+        };
 
         if len == 0 {
             // This flush will complete the transfer
@@ -284,7 +300,7 @@ pub fn read_selection_callback(
     );
 
     transfer.source_data.extend_from_slice(&buf[..len]);
-    if transfer.source_data.len() >= INCR_CHUNK_SIZE {
+    if transfer.source_data.len() > transfer.direct_property_limit {
         if !transfer.incr {
             // start incr transfer
             trace!(
@@ -296,7 +312,7 @@ pub fn read_selection_callback(
                 transfer.request.requestor,
                 transfer.request.property,
                 atoms.INCR,
-                &[INCR_CHUNK_SIZE as u32],
+                &[u32::try_from(transfer.source_data.len()).unwrap_or(u32::MAX)],
             )?;
             conn.flush()?;
             transfer.incr = true;

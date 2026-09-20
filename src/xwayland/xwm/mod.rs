@@ -2283,6 +2283,7 @@ where
                         let transfer = OutgoingTransfer {
                             conn: conn.clone(),
                             incr: false,
+                            direct_property_limit: selection::direct_property_limit(&conn),
                             token: Some(token),
                             source_data: Vec::new(),
                             request: n,
