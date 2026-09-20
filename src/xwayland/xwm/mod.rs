@@ -172,6 +172,7 @@ use x11rb::{
         composite::{ConnectionExt as _, Redirect},
         randr::{ConnectionExt as _, Notify, NotifyMask},
         render::{ConnectionExt as _, CreatePictureAux, PictureWrapper},
+        res::{ClientIdMask, ClientIdSpec, query_client_ids},
         sync::{ConnectionExt as _, Counter},
         xfixes::ConnectionExt as _,
         xproto::{
@@ -327,6 +328,18 @@ pub enum Reorder {
     Below(X11Window),
     /// to the bottom of the stack
     Bottom,
+}
+
+/// Identity of an X11 client requesting access to a selection.
+///
+/// `client_pid` is reported by the X-Resource extension for a local client.
+/// It is `None` when the server cannot provide a trustworthy process ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectionRequest {
+    /// Window supplied by the client in the X11 `SelectionRequest` event.
+    pub requestor: X11Window,
+    /// Local process ID owning `requestor`, when available through XRes.
+    pub client_pid: Option<u32>,
 }
 
 enum StackingDirection {
@@ -542,6 +555,20 @@ pub trait XwmHandler {
     fn allow_selection_access(&mut self, xwm: XwmId, selection: SelectionTarget) -> bool {
         let _ = (xwm, selection);
         false
+    }
+
+    /// An identified X11 client requests access to the given selection.
+    ///
+    /// The default preserves the policy of existing compositors. Implementors
+    /// that need requestor-aware authorization can override this method.
+    fn allow_selection_access_for_requestor(
+        &mut self,
+        xwm: XwmId,
+        selection: SelectionTarget,
+        request: SelectionRequest,
+    ) -> bool {
+        let _ = request;
+        self.allow_selection_access(xwm, selection)
     }
 
     /// The given selection is being read by an X client and needs to be written to the provided file descriptor
@@ -2068,10 +2095,26 @@ where
                 }
             };
 
+            let request = SelectionRequest {
+                requestor: n.requestor,
+                client_pid: query_client_ids(
+                    &conn,
+                    &[ClientIdSpec {
+                        client: n.requestor,
+                        mask: ClientIdMask::LOCAL_CLIENT_PID,
+                    }],
+                )
+                .ok()
+                .and_then(|cookie| cookie.reply().ok())
+                .and_then(|reply| reply.ids.into_iter().next())
+                .and_then(|id| id.value.into_iter().next())
+                .filter(|pid| *pid != 0),
+            };
+
             // work around borrowing
             drop(_guard);
             let allow_access = selection_type
-                .map(|type_| state.allow_selection_access(xwm_id, type_))
+                .map(|type_| state.allow_selection_access_for_requestor(xwm_id, type_, request))
                 .unwrap_or(true);
 
             let xwm = state.xwm_state(xwm_id);
